@@ -104,16 +104,20 @@ __setup("noexec32=", nonx32_setup);
  */
 static void sync_global_pgds(unsigned long start, unsigned long end)
 {
-	unsigned long flags;
 	struct page *page;
 	unsigned long addr;
 
-	spin_lock_irqsave(&pgd_lock, flags);
+	spin_lock(&pgd_lock);
 	for (addr = start; addr < end; addr += PGDIR_SIZE) {
 		pgd_t *ref_pgd = pgd_offset_k(addr);
 		list_for_each_entry(page, &pgd_list, lru) {
+			spinlock_t *pgt_lock;
 			pgd_t *pgd_base = page_address(page);
 			pgd_t *pgd = pgd_base + pgd_index(addr);
+
+			/* the pgt_lock only for Xen */
+			pgt_lock = &pgd_page_get_mm(page)->page_table_lock;
+			spin_lock(pgt_lock);
 
 			/*
 			 * When the state is the same in one other,
@@ -122,9 +126,11 @@ static void sync_global_pgds(unsigned long start, unsigned long end)
 			if (pgd_base != init_mm.pgd &&
 			    !!pgd_none(*pgd) != !!pgd_none(*ref_pgd))
 				set_pgd(pgd, *ref_pgd);
+
+			spin_unlock(pgt_lock);
 		}
 	}
-	spin_unlock_irqrestore(&pgd_lock, flags);
+	spin_unlock(&pgd_lock);
 }
 
 /*
@@ -930,18 +936,18 @@ static struct vm_area_struct gate_vma = {
 	.vm_flags	= VM_READ | VM_EXEC
 };
 
-struct vm_area_struct *get_gate_vma(struct task_struct *tsk)
+struct vm_area_struct *get_gate_vma(struct mm_struct *mm)
 {
 #ifdef CONFIG_IA32_EMULATION
-	if (test_tsk_thread_flag(tsk, TIF_IA32))
+	if (!mm || test_bit(MMF_COMPAT, &mm->flags))
 		return NULL;
 #endif
 	return &gate_vma;
 }
 
-int in_gate_area(struct task_struct *task, unsigned long addr)
+int in_gate_area(struct mm_struct *mm, unsigned long addr)
 {
-	struct vm_area_struct *vma = get_gate_vma(task);
+	struct vm_area_struct *vma = get_gate_vma(mm);
 
 	if (!vma)
 		return 0;
@@ -950,11 +956,11 @@ int in_gate_area(struct task_struct *task, unsigned long addr)
 }
 
 /*
- * Use this when you have no reliable task/vma, typically from interrupt
- * context. It is less reliable than using the task's vma and may give
- * false positives:
+ * Use this when you have no reliable mm, typically from interrupt
+ * context. It is less reliable than using a task's mm and may give
+ * false positives.
  */
-int in_gate_area_no_task(unsigned long addr)
+int in_gate_area_no_mm(unsigned long addr)
 {
 	return (addr >= VSYSCALL_START) && (addr < VSYSCALL_END);
 }

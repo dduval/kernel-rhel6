@@ -28,6 +28,8 @@ extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)];
 extern spinlock_t pgd_lock;
 extern struct list_head pgd_list;
 
+extern struct mm_struct *pgd_page_get_mm(struct page *page);
+
 #ifdef CONFIG_PARAVIRT
 #include <asm/paravirt.h>
 #else  /* !CONFIG_PARAVIRT */
@@ -80,9 +82,6 @@ extern struct list_head pgd_list;
 #define arch_end_context_switch(prev)	do {} while(0)
 
 #endif	/* CONFIG_PARAVIRT */
-
-#define pgd_page_get_mm(__page) \
-	((struct mm_struct *)(xen_pv_domain() ? (__page)->index : 0))
 
 /*
  * The following only work if pte_present() is true.
@@ -258,6 +257,16 @@ static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
 	val |= massage_pgprot(newprot) & ~_PAGE_CHG_MASK;
 
 	return __pte(val);
+}
+
+static inline pmd_t pmd_modify(pmd_t pmd, pgprot_t newprot)
+{
+	pmdval_t val = pmd_val(pmd);
+
+	val &= _HPAGE_CHG_MASK;
+	val |= massage_pgprot(newprot) & ~_HPAGE_CHG_MASK;
+
+	return __pmd(val);
 }
 
 /* mprotect needs to preserve PAT bits when updating vm_page_prot */

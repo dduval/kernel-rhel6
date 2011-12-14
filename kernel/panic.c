@@ -31,6 +31,7 @@ static int pause_on_oops_flag;
 static DEFINE_SPINLOCK(pause_on_oops_lock);
 
 int panic_timeout;
+EXPORT_SYMBOL_GPL(panic_timeout);
 
 ATOMIC_NOTIFIER_HEAD(panic_notifier_list);
 
@@ -246,7 +247,11 @@ void add_taint(unsigned flag)
 	 * Also we want to keep up lockdep for staging development and
 	 * post-warning case.
 	 */
-	if (flag != TAINT_CRAP && flag != TAINT_WARN && __debug_locks_off())
+	if (flag != TAINT_CRAP &&
+	    flag != TAINT_WARN &&
+	    flag != TAINT_TECH_PREVIEW &&
+	    flag != TAINT_HARDWARE_UNSUPPORTED &&
+	    __debug_locks_off())
 		printk(KERN_WARNING "Disabling lock debugging due to kernel taint\n");
 
 	set_bit(flag, &tainted_mask);

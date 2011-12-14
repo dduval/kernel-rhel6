@@ -127,6 +127,8 @@
 
 #include <linux/filter.h>
 
+#include <trace/events/sock.h>
+
 #ifdef CONFIG_INET
 #include <net/tcp.h>
 #endif
@@ -291,6 +293,7 @@ int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	if (atomic_read(&sk->sk_rmem_alloc) + skb->truesize >=
 	    (unsigned)sk->sk_rcvbuf) {
 		err = -ENOMEM;
+		trace_sock_rcvqueue_full(sk, skb);
 		goto out;
 	}
 
@@ -372,6 +375,7 @@ struct dst_entry *__sk_dst_check(struct sock *sk, u32 cookie)
 	struct dst_entry *dst = sk->sk_dst_cache;
 
 	if (dst && dst->obsolete && dst->ops->check(dst, cookie) == NULL) {
+		sk_tx_queue_clear(sk);
 		sk->sk_dst_cache = NULL;
 		dst_release(dst);
 		return NULL;
@@ -970,7 +974,8 @@ static void sock_copy(struct sock *nsk, const struct sock *osk)
 	BUILD_BUG_ON(offsetof(struct sock, sk_copy_start) !=
 		     sizeof(osk->sk_node) + sizeof(osk->sk_refcnt));
 	memcpy(&nsk->sk_copy_start, &osk->sk_copy_start,
-	       osk->sk_prot->obj_size - offsetof(struct sock, sk_copy_start));
+	       sk_alloc_size(osk->sk_prot->obj_size) -
+	       offsetof(struct sock, sk_copy_start));
 #ifdef CONFIG_SECURITY_NETWORK
 	nsk->sk_security = sptr;
 	security_sk_clone(osk, nsk);
@@ -997,12 +1002,13 @@ static struct sock *sk_prot_alloc(struct proto *prot, gfp_t priority,
 			if (offsetof(struct sock, sk_node.next) != 0)
 				memset(sk, 0, offsetof(struct sock, sk_node.next));
 			memset(&sk->sk_node.pprev, 0,
-			       prot->obj_size - offsetof(struct sock,
-							 sk_node.pprev));
+			       sk_alloc_size(prot->obj_size) -
+			       offsetof(struct sock,
+			       sk_node.pprev));
 		}
 	}
 	else
-		sk = kmalloc(prot->obj_size, priority);
+		sk = kmalloc(sk_alloc_size(prot->obj_size), priority);
 
 	if (sk != NULL) {
 		kmemcheck_annotate_bitfield(sk, flags);
@@ -1012,6 +1018,12 @@ static struct sock *sk_prot_alloc(struct proto *prot, gfp_t priority,
 
 		if (!try_module_get(prot->owner))
 			goto out_free_sec;
+		/*
+		 * assign sk_prot_creator earlier here. It's needed by
+		 * sk_extended called from sk_tx_queue_clear
+		 */
+		sk->sk_prot_creator = prot;
+		sk_tx_queue_clear(sk);
 	}
 
 	return sk;
@@ -1665,6 +1677,8 @@ suppress_allocation:
 			return 1;
 	}
 
+	trace_sock_exceed_buf_limit(sk, prot, allocated);
+
 	/* Alas. Undo changes. */
 	sk->sk_forward_alloc -= amt * SK_MEM_QUANTUM;
 	atomic_sub(amt, prot->memory_allocated);
@@ -2241,11 +2255,9 @@ static inline void release_proto_idx(struct proto *prot)
 
 int proto_register(struct proto *prot, int alloc_slab)
 {
-	/* Adjust obj_size first */
-	prot->obj_size = sk_alloc_size(prot->obj_size);
-
 	if (alloc_slab) {
-		prot->slab = kmem_cache_create(prot->name, prot->obj_size, 0,
+		prot->slab = kmem_cache_create(prot->name,
+					sk_alloc_size(prot->obj_size), 0,
 					SLAB_HWCACHE_ALIGN | prot->slab_flags,
 					NULL);
 
@@ -2264,7 +2276,7 @@ int proto_register(struct proto *prot, int alloc_slab)
 
 			sprintf(prot->rsk_prot->slab_name, mask, prot->name);
 			prot->rsk_prot->slab = kmem_cache_create(prot->rsk_prot->slab_name,
-								 prot->rsk_prot->obj_size, 0,
+								 sk_alloc_size(prot->rsk_prot->obj_size), 0,
 								 SLAB_HWCACHE_ALIGN, NULL);
 
 			if (prot->rsk_prot->slab == NULL) {
@@ -2285,7 +2297,7 @@ int proto_register(struct proto *prot, int alloc_slab)
 			sprintf(prot->twsk_prot->twsk_slab_name, mask, prot->name);
 			prot->twsk_prot->twsk_slab =
 				kmem_cache_create(prot->twsk_prot->twsk_slab_name,
-						  prot->twsk_prot->twsk_obj_size,
+						  sk_alloc_size(prot->twsk_prot->twsk_obj_size),
 						  0,
 						  SLAB_HWCACHE_ALIGN |
 							prot->slab_flags,

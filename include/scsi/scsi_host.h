@@ -125,6 +125,11 @@ struct scsi_host_template {
 	 * I/O pressure in the system if there are no other outstanding
 	 * commands.
 	 *
+	 * NOTE: The 'lockless' flag in the scsi_host_template indicates
+	 * whether the host_lock should be held before calling this
+	 * routine. Also, the lockless queuecommand, as implemented
+	 * upstream has a different signature.
+	 *
 	 * STATUS: REQUIRED
 	 */
 	int (* queuecommand)(struct scsi_cmnd *,
@@ -452,6 +457,15 @@ struct scsi_host_template {
 	 */
 	unsigned ordered_tag:1;
 
+#ifndef __GENKSYMS__
+	/*
+	 * True if we are calling queuecommand without the
+	 * host_lock held. LLDs may want to do this for
+	 * performance reasons.
+	 */
+	unsigned lockless:1;
+#endif /* __GENKSYMS__ */
+
 	/*
 	 * Countdown for host blocking with no commands outstanding.
 	 */
@@ -762,7 +776,8 @@ static inline struct device *scsi_get_device(struct Scsi_Host *shost)
  **/
 static inline int scsi_host_scan_allowed(struct Scsi_Host *shost)
 {
-	return shost->shost_state == SHOST_RUNNING;
+	return shost->shost_state == SHOST_RUNNING ||
+	       shost->shost_state == SHOST_RECOVERY;
 }
 
 extern void scsi_unblock_requests(struct Scsi_Host *);

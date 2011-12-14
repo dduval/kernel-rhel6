@@ -551,7 +551,7 @@ static void pci_dma_bus_setup_pSeries(struct pci_bus *bus)
 	pci->phb->dma_window_size = 0x8000000ul;
 	pci->phb->dma_window_base_cur = 0x8000000ul;
 
-	tbl = kmalloc_node(sizeof(struct iommu_table), GFP_KERNEL,
+	tbl = kzalloc_node(sizeof(struct iommu_table), GFP_KERNEL,
 			   pci->phb->node);
 
 	iommu_table_setparms(pci->phb, dn, tbl);
@@ -596,7 +596,7 @@ static void pci_dma_bus_setup_pSeriesLP(struct pci_bus *bus)
 		 pdn->full_name, ppci->iommu_table);
 
 	if (!ppci->iommu_table) {
-		tbl = kmalloc_node(sizeof(struct iommu_table), GFP_KERNEL,
+		tbl = kzalloc_node(sizeof(struct iommu_table), GFP_KERNEL,
 				   ppci->phb->node);
 		iommu_table_setparms_lpar(ppci->phb, pdn, tbl, dma_window,
 			bus->number);
@@ -626,7 +626,7 @@ static void pci_dma_dev_setup_pSeries(struct pci_dev *dev)
 		struct pci_controller *phb = PCI_DN(dn)->phb;
 
 		pr_debug(" --> first child, no bridge. Allocating iommu table.\n");
-		tbl = kmalloc_node(sizeof(struct iommu_table), GFP_KERNEL,
+		tbl = kzalloc_node(sizeof(struct iommu_table), GFP_KERNEL,
 				   phb->node);
 		iommu_table_setparms(phb, dn, tbl);
 		PCI_DN(dn)->iommu_table = iommu_init_table(tbl, phb->node);
@@ -698,7 +698,7 @@ static void remove_ddw(struct device_node *np)
 }
 
 
-static int dupe_ddw_if_already_created(struct pci_dev *dev, struct device_node *pdn)
+static u64 dupe_ddw_if_already_created(struct pci_dev *dev, struct device_node *pdn)
 {
 	struct device_node *dn;
 	struct pci_dn *pcidn;
@@ -735,16 +735,20 @@ static u64 dupe_ddw_if_kexec(struct pci_dev *dev, struct device_node *pdn)
 	pcidn = PCI_DN(dn);
 	direct64 = of_get_property(pdn, DIRECT64_PROPNAME, &len);
 	if (direct64) {
-		window = kzalloc(sizeof(*window), GFP_KERNEL);
-		if (!window) {
+		if (len < sizeof(struct dynamic_dma_window_prop)) {
 			remove_ddw(pdn);
 		} else {
-			window->device = pdn;
-			window->prop = direct64;
-			spin_lock(&direct_window_list_lock);
-			list_add(&window->list, &direct_window_list);
-			spin_unlock(&direct_window_list_lock);
-			dma_addr = direct64->dma_base;
+			window = kzalloc(sizeof(*window), GFP_KERNEL);
+			if (!window) {
+				remove_ddw(pdn);
+			} else {
+				window->device = pdn;
+				window->prop = direct64;
+				spin_lock(&direct_window_list_lock);
+				list_add(&window->list, &direct_window_list);
+				spin_unlock(&direct_window_list_lock);
+				dma_addr = direct64->dma_base;
+			}
 		}
 	}
 
@@ -838,7 +842,7 @@ static u64 enable_ddw(struct pci_dev *dev, struct device_node *pdn)
 	struct device_node *dn;
 	const u32 *uninitialized_var(ddr_avail);
 	struct direct_window *window;
-	struct property *uninitialized_var(win64);
+	struct property *win64;
 	struct dynamic_dma_window_prop *ddwprop;
 
 	mutex_lock(&direct_window_init_mutex);
@@ -912,6 +916,7 @@ static u64 enable_ddw(struct pci_dev *dev, struct device_node *pdn)
 	}
 	win64->name = kstrdup(DIRECT64_PROPNAME, GFP_KERNEL);
 	win64->value = ddwprop = kmalloc(sizeof(*ddwprop), GFP_KERNEL);
+	win64->length = sizeof(*ddwprop);
 	if (!win64->name || !win64->value) {
 		dev_info(&dev->dev,
 			"couldn't allocate property name and value\n");
@@ -1015,7 +1020,7 @@ static void pci_dma_dev_setup_pSeriesLP(struct pci_dev *dev)
 
 	pci = PCI_DN(pdn);
 	if (!pci->iommu_table) {
-		tbl = kmalloc_node(sizeof(struct iommu_table), GFP_KERNEL,
+		tbl = kzalloc_node(sizeof(struct iommu_table), GFP_KERNEL,
 				   pci->phb->node);
 		iommu_table_setparms_lpar(pci->phb, pdn, tbl, dma_window,
 			pci->phb->bus->number);
@@ -1036,13 +1041,16 @@ static int dma_set_mask_pSeriesLP(struct device *dev, u64 dma_mask)
 	const void *dma_window = NULL;
 	u64 dma_offset;
 
-	if (!dev->dma_mask || !dma_supported(dev, dma_mask))
+	if (!dev->dma_mask)
 		return -EIO;
+
+	if (!dev_is_pci(dev))
+		goto check_mask;
+
+	pdev = to_pci_dev(dev);
 
 	/* only attempt to use a new window if 64-bit DMA is requested */
 	if (!disable_ddw && dma_mask == DMA_BIT_MASK(64)) {
-		pdev = to_pci_dev(dev);
-
 		dn = pci_device_to_OF_node(pdev);
 		dev_dbg(dev, "node is %s\n", dn->full_name);
 
@@ -1069,11 +1077,16 @@ static int dma_set_mask_pSeriesLP(struct device *dev, u64 dma_mask)
 		}
 	}
 
-	/* fall-through to iommu ops */
-	if (!ddw_enabled) {
-		dev_info(dev, "Using 32-bit DMA via iommu\n");
+	/* fall back on iommu ops, restore table pointer with ops */
+	if (!ddw_enabled && get_dma_ops(dev) != &dma_iommu_ops) {
+		dev_info(dev, "Restoring 32-bit DMA via iommu\n");
 		set_dma_ops(dev, &dma_iommu_ops);
+		pci_dma_dev_setup_pSeriesLP(pdev);
 	}
+
+check_mask:
+	if (!dma_supported(dev, dma_mask))
+		return -EIO;
 
 	*dev->dma_mask = dma_mask;
 	return 0;

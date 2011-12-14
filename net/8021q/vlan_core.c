@@ -18,8 +18,9 @@ int __vlan_hwaccel_rx(struct sk_buff *skb, struct vlan_group *grp,
 		skb->deliver_no_wcard = 1;
 
 	skb->iif = skb->dev->ifindex;
-	__vlan_hwaccel_put_tag(skb, vlan_tci);
 	vlan_id = vlan_tci & VLAN_VID_MASK;
+	if (vlan_id)
+		__vlan_hwaccel_put_tag(skb, vlan_tci);
 	vlan_dev = vlan_group_get_device(grp, vlan_id);
 
 	if (vlan_dev)
@@ -39,6 +40,20 @@ int vlan_hwaccel_do_receive(struct sk_buff *skb)
 {
 	struct net_device *dev = skb->dev;
 	struct vlan_rx_stats     *rx_stats;
+
+	/*
+	 * skb->dev will still be the base interface if the VLAN does
+	 * not currently exist.  Do not continue if skb->dev is not a
+	 * VLAN device.  Set pkt_type to PACKET_OTHERHOST for all VLANs
+	 * except VID=0 since priority tagged frames are a special case.
+	 * Mirrors what is done upstream in vlan_do_receive in kernel
+	 * version 3.0 and later.
+	*/
+	if (!is_vlan_dev(skb->dev)) {
+		if (skb->vlan_tci & VLAN_VID_MASK)
+			skb->pkt_type = PACKET_OTHERHOST;
+		return 0;
+	}
 
 	skb->dev = vlan_dev_info(dev)->real_dev;
 	netif_nit_deliver(skb);
