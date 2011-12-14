@@ -508,9 +508,12 @@ static ssize_t send_buf(struct port *port, void *in_buf, size_t in_count,
 
 	/*
 	 * Wait till the host acknowledges it pushed out the data we
-	 * sent.  This is done for ports in blocking mode or for data
-	 * from the hvc_console; the tty operations are performed with
-	 * spinlocks held so we can't sleep here.
+	 * sent.  This is done for data from the hvc_console; the tty
+	 * operations are performed with spinlocks held so we can't
+	 * sleep here.  An alternative would be to copy the data to a
+	 * buffer and relax the spinning requirement.  The downside is
+	 * we need to kmalloc a GFP_ATOMIC buffer each time the
+	 * console driver writes something out.
 	 */
 	while (!virtqueue_get_buf(out_vq, &len))
 		cpu_relax();
@@ -652,6 +655,10 @@ static ssize_t port_fops_write(struct file *filp, const char __user *ubuf,
 	ssize_t ret;
 	bool nonblock;
 
+	/* Userspace could be out to fool us */
+	if (!count)
+		return 0;
+
 	port = filp->private_data;
 
 	nonblock = filp->f_flags & O_NONBLOCK;
@@ -681,6 +688,14 @@ static ssize_t port_fops_write(struct file *filp, const char __user *ubuf,
 		goto free_buf;
 	}
 
+	/*
+	 * We now ask send_buf() to not spin for generic ports -- we
+	 * can re-use the same code path that non-blocking file
+	 * descriptors take for blocking file descriptors since the
+	 * wait is already done and we're certain the write will go
+	 * through to the host.
+	 */
+	nonblock = true;
 	ret = send_buf(port, buf, count, nonblock);
 
 	if (nonblock && ret > 0)
@@ -705,7 +720,7 @@ static unsigned int port_fops_poll(struct file *filp, poll_table *wait)
 		return POLLHUP;
 	}
 	ret = 0;
-	if (port->inbuf)
+	if (!will_read_block(port))
 		ret |= POLLIN | POLLRDNORM;
 	if (!will_write_block(port))
 		ret |= POLLOUT;
@@ -1443,6 +1458,17 @@ static void control_work_handler(struct work_struct *work)
 	spin_unlock(&portdev->cvq_lock);
 }
 
+static void out_intr(struct virtqueue *vq)
+{
+	struct port *port;
+
+	port = find_port_by_vq(vq->vdev->priv, vq);
+	if (!port)
+		return;
+
+	wake_up_interruptible(&port->waitqueue);
+}
+
 static void in_intr(struct virtqueue *vq)
 {
 	struct port *port;
@@ -1562,7 +1588,7 @@ static int init_vqs(struct ports_device *portdev)
 	 */
 	j = 0;
 	io_callbacks[j] = in_intr;
-	io_callbacks[j + 1] = NULL;
+	io_callbacks[j + 1] = out_intr;
 	io_names[j] = "input";
 	io_names[j + 1] = "output";
 	j += 2;
@@ -1576,7 +1602,7 @@ static int init_vqs(struct ports_device *portdev)
 		for (i = 1; i < nr_ports; i++) {
 			j += 2;
 			io_callbacks[j] = in_intr;
-			io_callbacks[j + 1] = NULL;
+			io_callbacks[j + 1] = out_intr;
 			io_names[j] = "input";
 			io_names[j + 1] = "output";
 		}
