@@ -186,6 +186,7 @@ static void __init xen_banner(void)
 static __read_mostly unsigned int cpuid_leaf1_edx_mask = ~0;
 static __read_mostly unsigned int cpuid_leaf1_ecx_mask = ~0;
 static __read_mostly unsigned int cpuid_leaf81_edx_mask = ~0;
+static __read_mostly unsigned int cpuid_leaf87_edx_mask = 0;
 
 static void xen_cpuid(unsigned int *ax, unsigned int *bx,
 		      unsigned int *cx, unsigned int *dx)
@@ -204,6 +205,9 @@ static void xen_cpuid(unsigned int *ax, unsigned int *bx,
 		maskedx = cpuid_leaf1_edx_mask;
 		break;
 
+	case 5: /* CPUID_MWAIT_LEAF */
+		maskecx = maskedx = 0;
+
 	case 0xb:
 		/* Suppress extended topology stuff */
 		maskebx = 0;
@@ -211,6 +215,10 @@ static void xen_cpuid(unsigned int *ax, unsigned int *bx,
 
 	case 0x80000001:
 		maskedx = cpuid_leaf81_edx_mask;
+		break;
+
+	case 0x80000007:
+		maskedx = cpuid_leaf87_edx_mask;
 		break;
 	}
 
@@ -229,6 +237,8 @@ static void xen_cpuid(unsigned int *ax, unsigned int *bx,
 static __init void xen_init_cpuid_mask(void)
 {
 	unsigned int ax, bx, cx, dx;
+
+	cpuid_leaf1_ecx_mask = ~(1 << (X86_FEATURE_MWAIT % 32));
 
 	cpuid_leaf1_edx_mask =
 		~(1 << X86_FEATURE_ACC);   /* thermal monitoring */
