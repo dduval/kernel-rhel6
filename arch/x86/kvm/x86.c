@@ -993,6 +993,16 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 data)
 		pr_unimpl(vcpu, "unimplemented perfctr wrmsr: "
 			"0x%x data 0x%llx\n", msr, data);
 		break;
+	case MSR_K7_CLK_CTL:
+		/*
+		 * Ignore all writes to this no longer documented MSR.
+		 * Writes are only relevant for old K7 processors,
+		 * all pre-dating SVM, but a recommended workaround from
+		 * AMD for these chips. It is possible to speicify the
+		 * affected processor models on the command line, hence
+		 * the need to ignore the workaround.
+		 */
+		break;
 	default:
 		if (!ignore_msrs) {
 			pr_unimpl(vcpu, "unhandled wrmsr: 0x%x data %llx\n",
@@ -1125,6 +1135,20 @@ int kvm_get_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata)
 	case 0xcd: /* fsb frequency */
 		data = 3;
 		break;
+		/*
+		 * MSR_EBC_FREQUENCY_ID
+		 * Conservative value valid for even the basic CPU models.
+		 * Models 0,1: 000 in bits 23:21 indicating a bus speed of
+		 * 100MHz, model 2 000 in bits 18:16 indicating 100MHz,
+		 * and 266MHz for model 3, or 4. Set Core Clock
+		 * Frequency to System Bus Frequency Ratio to 1 (bits
+		 * 31:24) even though these are only valid for CPU
+		 * models > 2, however guests may end up dividing or
+		 * multiplying by zero otherwise.
+		 */
+	case MSR_EBC_FREQUENCY_ID:
+		data = 1 << 24;
+		break;
 	case MSR_IA32_APICBASE:
 		data = kvm_get_apic_base(vcpu);
 		break;
@@ -1158,6 +1182,18 @@ int kvm_get_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata)
 	case MSR_IA32_MCG_STATUS:
 	case MSR_IA32_MC0_CTL ... MSR_IA32_MC0_CTL + 4 * KVM_MAX_MCE_BANKS - 1:
 		return get_msr_mce(vcpu, msr, pdata);
+	case MSR_K7_CLK_CTL:
+		/*
+		 * Provide expected ramp-up count for K7. All other
+		 * are set to zero, indicating minimum divisors for
+		 * every field.
+		 *
+		 * This prevents guest kernels on AMD host with CPU
+		 * type 6, model 8 and higher from exploding due to
+		 * the rdmsr failing.
+		 */
+		data = 0x20000000;
+		break;
 	default:
 		if (!ignore_msrs) {
 			pr_unimpl(vcpu, "unhandled rdmsr: 0x%x\n", msr);
