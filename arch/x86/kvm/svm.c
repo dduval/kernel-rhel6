@@ -572,6 +572,8 @@ static void init_vmcb(struct vcpu_svm *svm)
 	struct vmcb_control_area *control = &svm->vmcb->control;
 	struct vmcb_save_area *save = &svm->vmcb->save;
 
+	svm->vcpu.fpu_active = 1;
+
 	control->intercept_cr_read = 	INTERCEPT_CR0_MASK |
 					INTERCEPT_CR3_MASK |
 					INTERCEPT_CR4_MASK;
@@ -756,7 +758,6 @@ static struct kvm_vcpu *svm_create_vcpu(struct kvm *kvm, unsigned int id)
 	init_vmcb(svm);
 
 	fx_init(&svm->vcpu);
-	svm->vcpu.fpu_active = 1;
 	svm->vcpu.arch.apic_base = 0xfee00000 | MSR_IA32_APICBASE_ENABLE;
 	if (kvm_vcpu_is_bsp(&svm->vcpu))
 		svm->vcpu.arch.apic_base |= MSR_IA32_APICBASE_BSP;
@@ -987,6 +988,10 @@ static void svm_set_gdt(struct kvm_vcpu *vcpu, struct descriptor_table *dt)
 	svm->vmcb->save.gdtr.base = dt->base ;
 }
 
+static void svm_decache_cr0_guest_bits(struct kvm_vcpu *vcpu)
+{
+}
+
 static void svm_decache_cr4_guest_bits(struct kvm_vcpu *vcpu)
 {
 }
@@ -1011,17 +1016,11 @@ static void svm_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0)
 	if (npt_enabled)
 		goto set;
 
-	if ((vcpu->arch.cr0 & X86_CR0_TS) && !(cr0 & X86_CR0_TS)) {
-		svm->vmcb->control.intercept_exceptions &= ~(1 << NM_VECTOR);
-		vcpu->fpu_active = 1;
-	}
-
 	vcpu->arch.cr0 = cr0;
 	cr0 |= X86_CR0_PG | X86_CR0_WP;
-	if (!vcpu->fpu_active) {
-		svm->vmcb->control.intercept_exceptions |= (1 << NM_VECTOR);
+
+	if (!vcpu->fpu_active)
 		cr0 |= X86_CR0_TS;
-	}
 set:
 	/*
 	 * re-enable caching here because the QEMU bios
@@ -1285,8 +1284,10 @@ static int ud_interception(struct vcpu_svm *svm)
 static int nm_interception(struct vcpu_svm *svm)
 {
 	svm->vmcb->control.intercept_exceptions &= ~(1 << NM_VECTOR);
-	if (!(svm->vcpu.arch.cr0 & X86_CR0_TS))
+	if (!kvm_read_cr0_bits(&svm->vcpu, X86_CR0_TS))
 		svm->vmcb->save.cr0 &= ~X86_CR0_TS;
+	else
+		svm->vmcb->save.cr0 |= X86_CR0_TS;
 	svm->vcpu.fpu_active = 1;
 
 	return 1;
@@ -1834,7 +1835,7 @@ static bool nested_svm_vmrun(struct vcpu_svm *svm)
 	hsave->save.gdtr   = vmcb->save.gdtr;
 	hsave->save.idtr   = vmcb->save.idtr;
 	hsave->save.efer   = svm->vcpu.arch.shadow_efer;
-	hsave->save.cr0    = svm->vcpu.arch.cr0;
+	hsave->save.cr0    = kvm_read_cr0(&svm->vcpu);
 	hsave->save.cr4    = svm->vcpu.arch.cr4;
 	hsave->save.rflags = vmcb->save.rflags;
 	hsave->save.rip    = svm->next_rip;
@@ -2474,7 +2475,8 @@ static int handle_exit(struct kvm_vcpu *vcpu)
 
 	if (npt_enabled) {
 		int mmu_reload = 0;
-		if ((vcpu->arch.cr0 ^ svm->vmcb->save.cr0) & X86_CR0_PG) {
+		if ((kvm_read_cr0_bits(vcpu, X86_CR0_PG) ^ svm->vmcb->save.cr0)
+		    & X86_CR0_PG) {
 			svm_set_cr0(vcpu, svm->vmcb->save.cr0);
 			mmu_reload = 1;
 		}
@@ -2661,6 +2663,8 @@ static void svm_flush_tlb(struct kvm_vcpu *vcpu)
 
 static void svm_prepare_guest_switch(struct kvm_vcpu *vcpu)
 {
+	if (npt_enabled)
+		vcpu->fpu_active = 1;
 }
 
 static inline void sync_cr8_to_lapic(struct kvm_vcpu *vcpu)
@@ -2893,12 +2897,6 @@ static void svm_set_cr3(struct kvm_vcpu *vcpu, unsigned long root)
 
 	svm->vmcb->save.cr3 = root;
 	force_new_asid(vcpu);
-
-	if (vcpu->fpu_active) {
-		svm->vmcb->control.intercept_exceptions |= (1 << NM_VECTOR);
-		svm->vmcb->save.cr0 |= X86_CR0_TS;
-		vcpu->fpu_active = 0;
-	}
 }
 
 static int is_disabled(void)
@@ -3005,6 +3003,20 @@ static bool svm_gb_page_enable(void)
 	return true;
 }
 
+static void svm_fpu_deactivate(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_svm *svm = to_svm(vcpu);
+
+	if (npt_enabled) {
+		/* hack: npt requires active fpu at this time */
+		vcpu->fpu_active = 1;
+		return;
+	}
+
+	svm->vmcb->control.intercept_exceptions |= 1 << NM_VECTOR;
+	svm->vmcb->save.cr0 |= X86_CR0_TS;
+}
+
 static struct kvm_x86_ops svm_x86_ops = {
 	.cpu_has_kvm_support = has_svm,
 	.disabled_by_bios = is_disabled,
@@ -3031,6 +3043,7 @@ static struct kvm_x86_ops svm_x86_ops = {
 	.set_segment = svm_set_segment,
 	.get_cpl = svm_get_cpl,
 	.get_cs_db_l_bits = kvm_get_cs_db_l_bits,
+	.decache_cr0_guest_bits = svm_decache_cr0_guest_bits,
 	.decache_cr4_guest_bits = svm_decache_cr4_guest_bits,
 	.set_cr0 = svm_set_cr0,
 	.set_cr3 = svm_set_cr3,
@@ -3045,6 +3058,7 @@ static struct kvm_x86_ops svm_x86_ops = {
 	.cache_reg = svm_cache_reg,
 	.get_rflags = svm_get_rflags,
 	.set_rflags = svm_set_rflags,
+	.fpu_deactivate = svm_fpu_deactivate,
 
 	.tlb_flush = svm_flush_tlb,
 

@@ -1635,8 +1635,10 @@ struct request_queue *__scsi_alloc_queue(struct Scsi_Host *shost,
 	blk_queue_max_segment_size(q, dma_get_max_seg_size(dev));
 
 	/* New queue, no concurrency on queue_flags */
-	if (!shost->use_clustering)
+	if (!shost->use_clustering) {
 		queue_flag_clear_unlocked(QUEUE_FLAG_CLUSTER, q);
+		q->limits.no_cluster = 1;
+	}
 
 	/*
 	 * set a reasonable default alignment on word boundaries: the
@@ -2421,17 +2423,18 @@ scsi_internal_device_unblock(struct scsi_device *sdev)
 {
 	struct request_queue *q = sdev->request_queue; 
 	unsigned long flags;
-	
+	int err;
+
 	/* 
 	 * Try to transition the scsi device to SDEV_RUNNING
 	 * and goose the device queue if successful.  
 	 */
-	if (sdev->sdev_state == SDEV_BLOCK)
-		sdev->sdev_state = SDEV_RUNNING;
-	else if (sdev->sdev_state == SDEV_CREATED_BLOCK)
-		sdev->sdev_state = SDEV_CREATED;
-	else
-		return -EINVAL;
+	err = scsi_device_set_state(sdev, SDEV_RUNNING);
+	if (err) {
+		err = scsi_device_set_state(sdev, SDEV_CREATED);
+		if (err)
+			return err;
+	}
 
 	spin_lock_irqsave(q->queue_lock, flags);
 	blk_start_queue(q);

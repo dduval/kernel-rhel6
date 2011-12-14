@@ -49,6 +49,7 @@
 #include <asm/desc.h>
 #include <asm/mtrr.h>
 #include <asm/mce.h>
+#include <asm/i387.h>
 
 #define MAX_IO_MSRS 256
 #define CR0_RESERVED_BITS						\
@@ -386,6 +387,8 @@ int kvm_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0)
 	if (cr0 & CR0_RESERVED_BITS)
 		return 1;
 
+	cr0 |= X86_CR0_ET;
+
 	if ((cr0 & X86_CR0_NW) && !(cr0 & X86_CR0_CD))
 		return 1;
 
@@ -419,7 +422,7 @@ EXPORT_SYMBOL_GPL(kvm_set_cr0);
 
 void kvm_lmsw(struct kvm_vcpu *vcpu, unsigned long msw)
 {
-	(void)kvm_set_cr0(vcpu, (vcpu->arch.cr0 & ~0x0eul) | (msw & 0x0f));
+	(void)kvm_set_cr0(vcpu, kvm_read_cr0_bits(vcpu, ~0x0eul) | (msw & 0x0f));
 }
 EXPORT_SYMBOL_GPL(kvm_lmsw);
 
@@ -1415,8 +1418,8 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
 
 void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
 {
-	kvm_x86_ops->vcpu_put(vcpu);
 	kvm_put_guest_fpu(vcpu);
+	kvm_x86_ops->vcpu_put(vcpu);
 }
 
 static int is_efer_nx(void)
@@ -3088,7 +3091,7 @@ int emulate_invlpg(struct kvm_vcpu *vcpu, gva_t address)
 
 int emulate_clts(struct kvm_vcpu *vcpu)
 {
-	kvm_x86_ops->set_cr0(vcpu, vcpu->arch.cr0 & ~X86_CR0_TS);
+	kvm_x86_ops->set_cr0(vcpu, kvm_read_cr0_bits(vcpu, ~X86_CR0_TS));
 	return X86EMUL_CONTINUE;
 }
 
@@ -3735,7 +3738,7 @@ unsigned long realmode_get_cr(struct kvm_vcpu *vcpu, int cr)
 	kvm_x86_ops->decache_cr4_guest_bits(vcpu);
 	switch (cr) {
 	case 0:
-		value = vcpu->arch.cr0;
+		value = kvm_read_cr0(vcpu);
 		break;
 	case 2:
 		value = vcpu->arch.cr2;
@@ -3764,7 +3767,7 @@ int realmode_set_cr(struct kvm_vcpu *vcpu, int cr, unsigned long val,
 
 	switch (cr) {
 	case 0:
-		res = kvm_set_cr0(vcpu, mk_cr_64(vcpu->arch.cr0, val));
+		res = kvm_set_cr0(vcpu, mk_cr_64(kvm_read_cr0(vcpu), val));
 		*rflags = kvm_x86_ops->get_rflags(vcpu);
 		break;
 	case 2:
@@ -4031,6 +4034,10 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 			vcpu->run->exit_reason = KVM_EXIT_SHUTDOWN;
 			r = 0;
 			goto out;
+		}
+		if (test_and_clear_bit(KVM_REQ_DEACTIVATE_FPU, &vcpu->requests)) {
+			vcpu->fpu_active = 0;
+			kvm_x86_ops->fpu_deactivate(vcpu);
 		}
 	}
 
@@ -4373,7 +4380,7 @@ int kvm_arch_vcpu_ioctl_get_sregs(struct kvm_vcpu *vcpu,
 	sregs->gdt.base = dt.base;
 
 	kvm_x86_ops->decache_cr4_guest_bits(vcpu);
-	sregs->cr0 = vcpu->arch.cr0;
+	sregs->cr0 = kvm_read_cr0(vcpu);
 	sregs->cr2 = vcpu->arch.cr2;
 	sregs->cr3 = vcpu->arch.cr3;
 	sregs->cr4 = vcpu->arch.cr4;
@@ -4560,7 +4567,7 @@ int kvm_load_segment_descriptor(struct kvm_vcpu *vcpu, u16 selector, int seg)
 	bool null_selector = !(selector & ~0x3); /* 0000-0003 are null */
 	int ret;
 
-	if (is_vm86_segment(vcpu, seg) || !(vcpu->arch.cr0 & X86_CR0_PE))
+	if (is_vm86_segment(vcpu, seg) || !(kvm_read_cr0_bits(vcpu, X86_CR0_PE)))
 		return kvm_load_realmode_segment(vcpu, selector, seg);
 
 	/* NULL selector is not valid for TR, CS and SS */
@@ -4962,7 +4969,7 @@ int kvm_task_switch(struct kvm_vcpu *vcpu, u16 tss_selector, int reason)
 					      &nseg_desc);
 	}
 
-	kvm_x86_ops->set_cr0(vcpu, vcpu->arch.cr0 | X86_CR0_TS);
+	kvm_x86_ops->set_cr0(vcpu, kvm_read_cr0(vcpu) | X86_CR0_TS);
 	seg_desct_to_kvm_desct(&nseg_desc, tss_selector, &tr_seg);
 	tr_seg.type = 11;
 	kvm_set_segment(vcpu, &tr_seg, VCPU_SREG_TR);
@@ -4999,7 +5006,7 @@ int kvm_arch_vcpu_ioctl_set_sregs(struct kvm_vcpu *vcpu,
 
 	kvm_x86_ops->decache_cr4_guest_bits(vcpu);
 
-	mmu_reset_needed |= vcpu->arch.cr0 != sregs->cr0;
+	mmu_reset_needed |= kvm_read_cr0(vcpu) != sregs->cr0;
 	kvm_x86_ops->set_cr0(vcpu, sregs->cr0);
 	vcpu->arch.cr0 = sregs->cr0;
 
@@ -5036,7 +5043,7 @@ int kvm_arch_vcpu_ioctl_set_sregs(struct kvm_vcpu *vcpu,
 	/* Older userspace won't unhalt the vcpu on reset. */
 	if (kvm_vcpu_is_bsp(vcpu) && kvm_rip_read(vcpu) == 0xfff0 &&
 	    sregs->cs.selector == 0xf000 && sregs->cs.base == 0xffff0000 &&
-	    !(vcpu->arch.cr0 & X86_CR0_PE))
+	    !(kvm_read_cr0_bits(vcpu, X86_CR0_PE)))
 		vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
 
 	vcpu_put(vcpu);
@@ -5163,21 +5170,10 @@ void fx_init(struct kvm_vcpu *vcpu)
 {
 	unsigned after_mxcsr_mask;
 
-	/*
-	 * Touch the fpu the first time in non atomic context as if
-	 * this is the first fpu instruction the exception handler
-	 * will fire before the instruction returns and it'll have to
-	 * allocate ram with GFP_KERNEL.
-	 */
-	if (!used_math())
-		kvm_fx_save(&vcpu->arch.host_fx_image);
-
 	/* Initialize guest FPU by resetting ours and saving into guest's */
 	preempt_disable();
-	kvm_fx_save(&vcpu->arch.host_fx_image);
 	kvm_fx_finit();
 	kvm_fx_save(&vcpu->arch.guest_fx_image);
-	kvm_fx_restore(&vcpu->arch.host_fx_image);
 	preempt_enable();
 
 	vcpu->arch.cr0 |= X86_CR0_ET;
@@ -5194,7 +5190,7 @@ void kvm_load_guest_fpu(struct kvm_vcpu *vcpu)
 		return;
 
 	vcpu->guest_fpu_loaded = 1;
-	kvm_fx_save(&vcpu->arch.host_fx_image);
+	unlazy_fpu(current);
 	kvm_fx_restore(&vcpu->arch.guest_fx_image);
 }
 EXPORT_SYMBOL_GPL(kvm_load_guest_fpu);
@@ -5206,8 +5202,8 @@ void kvm_put_guest_fpu(struct kvm_vcpu *vcpu)
 
 	vcpu->guest_fpu_loaded = 0;
 	kvm_fx_save(&vcpu->arch.guest_fx_image);
-	kvm_fx_restore(&vcpu->arch.host_fx_image);
 	++vcpu->stat.fpu_reload;
+	set_bit(KVM_REQ_DEACTIVATE_FPU, &vcpu->requests);
 }
 EXPORT_SYMBOL_GPL(kvm_put_guest_fpu);
 
@@ -5230,9 +5226,6 @@ struct kvm_vcpu *kvm_arch_vcpu_create(struct kvm *kvm,
 int kvm_arch_vcpu_setup(struct kvm_vcpu *vcpu)
 {
 	int r;
-
-	/* We do fxsave: this must be aligned. */
-	BUG_ON((unsigned long)&vcpu->arch.host_fx_image & 0xF);
 
 	vcpu->arch.mtrr_state.have_fixed = 1;
 	vcpu_load(vcpu);
